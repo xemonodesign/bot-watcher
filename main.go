@@ -411,27 +411,45 @@ func getServerCountFromDiscordAPI(_, token string) (int, error) {
 
 	log.Printf("Bot user: %s (ID: %s)", botUser.Username, botUser.ID)
 
-	// Method 2: Use Gateway connection to get accurate guild count for sharded bots
-	// This is the most reliable method for sharded bots
+	// Method 2: Get recommended shard count from Discord
+	gateway, err := botSession.GatewayBot()
+	if err != nil {
+		log.Printf("Failed to get gateway info, using REST API only: %v", err)
+	} else {
+		log.Printf("Recommended shards: %d", gateway.Shards)
+		
+		// If sharding is required, try with proper shard configuration
+		if gateway.Shards > 1 {
+			return getServerCountWithSharding(botSession, gateway.Shards)
+		}
+	}
+
+	// Method 3: Try Gateway connection for non-sharded or fallback
 	err = botSession.Open()
 	if err != nil {
-		return 0, fmt.Errorf("failed to open websocket connection: %v", err)
+		// If sharding is required, try with minimal sharding
+		if strings.Contains(err.Error(), "4011") || strings.Contains(err.Error(), "Sharding required") {
+			log.Printf("Sharding required, attempting with shard configuration")
+			return getServerCountWithSharding(botSession, 1)
+		}
+		log.Printf("Failed to open websocket connection: %v, falling back to REST API", err)
+	} else {
+		defer botSession.Close()
+
+		// Wait a moment for the ready event and guild information to populate
+		time.Sleep(3 * time.Second)
+
+		// Get guild count from the session state
+		guildCount := len(botSession.State.Guilds)
+		log.Printf("Guild count from session state: %d", guildCount)
+
+		if guildCount > 0 {
+			return guildCount, nil
+		}
 	}
-	defer botSession.Close()
 
-	// Wait a moment for the ready event and guild information to populate
-	time.Sleep(3 * time.Second)
-
-	// Get guild count from the session state
-	guildCount := len(botSession.State.Guilds)
-	log.Printf("Guild count from session state: %d", guildCount)
-
-	if guildCount > 0 {
-		return guildCount, nil
-	}
-
-	// Method 3: Fallback to REST API if Gateway method fails
-	log.Printf("Gateway method returned 0 guilds, falling back to REST API")
+	// Method 4: Fallback to REST API
+	log.Printf("Falling back to REST API")
 
 	totalGuilds := 0
 	after := ""
@@ -459,16 +477,59 @@ func getServerCountFromDiscordAPI(_, token string) (int, error) {
 	}
 
 	log.Printf("REST API returned %d guilds", totalGuilds)
+	return totalGuilds, nil
+}
 
-	// If both methods returned different results, log a warning
-	if guildCount > 0 && totalGuilds > 0 && guildCount != totalGuilds {
-		log.Printf("Warning: Gateway (%d) and REST API (%d) returned different counts", guildCount, totalGuilds)
-		// Return the larger count as it's more likely to be accurate for sharded bots
-		if guildCount > totalGuilds {
-			return guildCount, nil
-		}
+func getServerCountWithSharding(botSession *discordgo.Session, recommendedShards int) (int, error) {
+	log.Printf("Attempting sharded connection with %d shards", recommendedShards)
+	
+	// Set shard information
+	botSession.ShardID = 0
+	botSession.ShardCount = recommendedShards
+	
+	err := botSession.Open()
+	if err != nil {
+		return 0, fmt.Errorf("failed to open sharded connection: %v", err)
+	}
+	defer botSession.Close()
+
+	// Wait for ready event and guild population
+	time.Sleep(5 * time.Second)
+
+	guildCount := len(botSession.State.Guilds)
+	log.Printf("Shard 0 guild count: %d", guildCount)
+
+	// For sharded bots, we can only get the count from shard 0
+	// The real total would be across all shards, but we can't connect to all shards with one token
+	// So we'll estimate or use REST API instead
+	if guildCount > 0 {
+		log.Printf("Got %d guilds from shard 0, but this is not the total count for sharded bot", guildCount)
 	}
 
+	// Use REST API for accurate total count
+	totalGuilds := 0
+	after := ""
+
+	for {
+		guilds, err := botSession.UserGuilds(100, "", after)
+		if err != nil {
+			return 0, fmt.Errorf("failed to fetch guilds via REST API in sharded mode: %v", err)
+		}
+
+		if len(guilds) == 0 {
+			break
+		}
+
+		totalGuilds += len(guilds)
+
+		if len(guilds) < 100 {
+			break
+		}
+
+		after = guilds[len(guilds)-1].ID
+	}
+
+	log.Printf("REST API in sharded mode returned %d guilds", totalGuilds)
 	return totalGuilds, nil
 }
 
