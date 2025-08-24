@@ -82,15 +82,28 @@ func main() {
 	// Parse bot tokens (format: BOT_ID:TOKEN,BOT_ID:TOKEN)
 	botTokens := make(map[string]string)
 	if tokens := os.Getenv("BOT_TOKENS"); tokens != "" {
-		log.Printf("Parsing BOT_TOKENS: %s", tokens)
-		for _, token := range strings.Split(tokens, ",") {
-			parts := strings.Split(strings.TrimSpace(token), ":")
-			if len(parts) >= 2 {
-				// Join the remaining parts in case the token contains colons
-				botID := strings.TrimSpace(parts[0])
-				botToken := strings.Join(parts[1:], ":")
-				botTokens[botID] = botToken
-				log.Printf("Added bot token for ID: %s", botID)
+		log.Printf("Parsing BOT_TOKENS (length: %d)", len(tokens))
+		
+		// Split by comma first
+		tokenPairs := strings.Split(tokens, ",")
+		for i, tokenPair := range tokenPairs {
+			tokenPair = strings.TrimSpace(tokenPair)
+			log.Printf("Processing token pair %d: %s", i+1, tokenPair)
+			
+			// Find the first colon to split ID and token
+			colonIndex := strings.Index(tokenPair, ":")
+			if colonIndex > 0 && colonIndex < len(tokenPair)-1 {
+				botID := strings.TrimSpace(tokenPair[:colonIndex])
+				botToken := strings.TrimSpace(tokenPair[colonIndex+1:])
+				
+				if botID != "" && botToken != "" {
+					botTokens[botID] = botToken
+					log.Printf("Added bot token for ID: %s (token length: %d)", botID, len(botToken))
+				} else {
+					log.Printf("Invalid token pair: empty ID or token")
+				}
+			} else {
+				log.Printf("Invalid token pair format: %s", tokenPair)
 			}
 		}
 	}
