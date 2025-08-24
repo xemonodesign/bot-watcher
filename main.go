@@ -506,14 +506,21 @@ func getServerCountWithSharding(botSession *discordgo.Session, recommendedShards
 		log.Printf("Got %d guilds from shard 0, but this is not the total count for sharded bot", guildCount)
 	}
 
-	// Use REST API for accurate total count
+	// Use REST API for accurate total count with larger limit
 	totalGuilds := 0
 	after := ""
+	maxIterations := 50 // Safety limit to prevent infinite loops
+	iteration := 0
 
-	for {
-		guilds, err := botSession.UserGuilds(100, "", after)
+	for iteration < maxIterations {
+		// Try to get more guilds per request (max is 200)
+		guilds, err := botSession.UserGuilds(200, "", after)
 		if err != nil {
-			return 0, fmt.Errorf("failed to fetch guilds via REST API in sharded mode: %v", err)
+			// If 200 fails, try with 100
+			guilds, err = botSession.UserGuilds(100, "", after)
+			if err != nil {
+				return 0, fmt.Errorf("failed to fetch guilds via REST API in sharded mode: %v", err)
+			}
 		}
 
 		if len(guilds) == 0 {
@@ -521,15 +528,32 @@ func getServerCountWithSharding(botSession *discordgo.Session, recommendedShards
 		}
 
 		totalGuilds += len(guilds)
+		log.Printf("REST API iteration %d: got %d guilds, total: %d", iteration+1, len(guilds), totalGuilds)
 
-		if len(guilds) < 100 {
+		// If we got less than the requested amount, we're done
+		if len(guilds) < 200 && len(guilds) < 100 {
 			break
 		}
 
 		after = guilds[len(guilds)-1].ID
+		iteration++
+		
+		// Small delay to avoid rate limiting
+		time.Sleep(100 * time.Millisecond)
 	}
 
-	log.Printf("REST API in sharded mode returned %d guilds", totalGuilds)
+	if iteration >= maxIterations {
+		log.Printf("Warning: Reached maximum iterations (%d), there might be more guilds", maxIterations)
+	}
+
+	log.Printf("REST API in sharded mode returned %d guilds after %d iterations", totalGuilds, iteration)
+	
+	// If we still don't have the expected count, try a different approach
+	if totalGuilds < 2500 { // If it seems incomplete for a large bot
+		log.Printf("Guild count seems low for a sharded bot, this might be due to API limitations")
+		log.Printf("Consider using a custom webhook endpoint for more accurate counts")
+	}
+	
 	return totalGuilds, nil
 }
 
