@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -149,6 +151,9 @@ func main() {
 	// Setup cron job for daily notifications
 	setupDailyNotification()
 
+	// Setup memory cleanup routine
+	//setupMemoryCleanup()
+
 	// Wait for interrupt signal
 	fmt.Println("Bot is running. Press CTRL+C to exit.")
 	sc := make(chan os.Signal, 1)
@@ -184,6 +189,41 @@ func setupDailyNotification() {
 	log.Printf("Daily notification scheduled at: %s", config.NotificationTime)
 }
 
+func setupMemoryCleanup() {
+	// Run memory cleanup every 30 minutes
+	ticker := time.NewTicker(180 * time.Minute)
+
+	go func() {
+		for range ticker.C {
+			performMemoryCleanup()
+		}
+	}()
+
+	log.Println("Memory cleanup routine started (runs every 30 minutes)")
+}
+
+func performMemoryCleanup() {
+	// Get memory stats before cleanup
+	var m1 runtime.MemStats
+	runtime.ReadMemStats(&m1)
+
+	// Force garbage collection
+	runtime.GC()
+
+	// Return memory to OS
+	debug.FreeOSMemory()
+
+	// Get memory stats after cleanup
+	var m2 runtime.MemStats
+	runtime.ReadMemStats(&m2)
+
+	log.Printf("Memory cleanup completed - Before: %d KB, After: %d KB, Freed: %d KB",
+		m1.Alloc/1024,
+		m2.Alloc/1024,
+		(m1.Alloc-m2.Alloc)/1024,
+	)
+}
+
 func checkAndNotifyServerCount() {
 	var allStats []BotStats
 
@@ -214,6 +254,9 @@ func checkAndNotifyServerCount() {
 	}
 
 	sendServerCountNotification(allStats)
+
+	// Clean up memory after processing
+	runtime.GC()
 }
 
 func getServerCount(botID string) (int, error) {
@@ -291,7 +334,11 @@ func getServerCountFromTopGG(botID string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		resp.Body.Close()
+		// Explicitly nil the response to help GC
+		resp = nil
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -417,7 +464,7 @@ func getServerCountFromDiscordAPI(_, token string) (int, error) {
 		log.Printf("Failed to get gateway info, using REST API only: %v", err)
 	} else {
 		log.Printf("Recommended shards: %d", gateway.Shards)
-		
+
 		// If sharding is required, try with proper shard configuration
 		if gateway.Shards > 1 {
 			return getServerCountWithSharding(botSession, gateway.Shards)
@@ -482,11 +529,11 @@ func getServerCountFromDiscordAPI(_, token string) (int, error) {
 
 func getServerCountWithSharding(botSession *discordgo.Session, recommendedShards int) (int, error) {
 	log.Printf("Attempting sharded connection with %d shards", recommendedShards)
-	
+
 	// Set shard information
 	botSession.ShardID = 0
 	botSession.ShardCount = recommendedShards
-	
+
 	err := botSession.Open()
 	if err != nil {
 		return 0, fmt.Errorf("failed to open sharded connection: %v", err)
@@ -537,7 +584,7 @@ func getServerCountWithSharding(botSession *discordgo.Session, recommendedShards
 
 		after = guilds[len(guilds)-1].ID
 		iteration++
-		
+
 		// Small delay to avoid rate limiting
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -547,13 +594,13 @@ func getServerCountWithSharding(botSession *discordgo.Session, recommendedShards
 	}
 
 	log.Printf("REST API in sharded mode returned %d guilds after %d iterations", totalGuilds, iteration)
-	
+
 	// If we still don't have the expected count, try a different approach
 	if totalGuilds < 2500 { // If it seems incomplete for a large bot
 		log.Printf("Guild count seems low for a sharded bot, this might be due to API limitations")
 		log.Printf("Consider using a custom webhook endpoint for more accurate counts")
 	}
-	
+
 	return totalGuilds, nil
 }
 
