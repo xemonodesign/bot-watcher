@@ -83,19 +83,19 @@ func main() {
 	botTokens := make(map[string]string)
 	if tokens := os.Getenv("BOT_TOKENS"); tokens != "" {
 		log.Printf("Parsing BOT_TOKENS (length: %d)", len(tokens))
-		
+
 		// Split by comma first
 		tokenPairs := strings.Split(tokens, ",")
 		for i, tokenPair := range tokenPairs {
 			tokenPair = strings.TrimSpace(tokenPair)
 			log.Printf("Processing token pair %d: %s", i+1, tokenPair)
-			
+
 			// Find the first colon to split ID and token
 			colonIndex := strings.Index(tokenPair, ":")
 			if colonIndex > 0 && colonIndex < len(tokenPair)-1 {
 				botID := strings.TrimSpace(tokenPair[:colonIndex])
 				botToken := strings.TrimSpace(tokenPair[colonIndex+1:])
-				
+
 				if botID != "" && botToken != "" {
 					botTokens[botID] = botToken
 					log.Printf("Added bot token for ID: %s (token length: %d)", botID, len(botToken))
@@ -403,16 +403,44 @@ func getServerCountFromDiscordAPI(_, token string) (int, error) {
 		return 0, fmt.Errorf("failed to create Discord session: %v", err)
 	}
 
-	// We don't need to open a websocket connection, just use REST API
-	// Get the bot's guilds using the correct endpoint
+	// Method 1: Try to get bot info first to check if it's sharded
+	botUser, err := botSession.User("@me")
+	if err != nil {
+		return 0, fmt.Errorf("failed to get bot user info: %v", err)
+	}
+
+	log.Printf("Bot user: %s (ID: %s)", botUser.Username, botUser.ID)
+
+	// Method 2: Use Gateway connection to get accurate guild count for sharded bots
+	// This is the most reliable method for sharded bots
+	err = botSession.Open()
+	if err != nil {
+		return 0, fmt.Errorf("failed to open websocket connection: %v", err)
+	}
+	defer botSession.Close()
+
+	// Wait a moment for the ready event and guild information to populate
+	time.Sleep(3 * time.Second)
+
+	// Get guild count from the session state
+	guildCount := len(botSession.State.Guilds)
+	log.Printf("Guild count from session state: %d", guildCount)
+
+	if guildCount > 0 {
+		return guildCount, nil
+	}
+
+	// Method 3: Fallback to REST API if Gateway method fails
+	log.Printf("Gateway method returned 0 guilds, falling back to REST API")
+
 	totalGuilds := 0
 	after := ""
 
 	for {
-		// Use the correct method to get guilds
+		// Use the REST API method
 		guilds, err := botSession.UserGuilds(100, "", after)
 		if err != nil {
-			return 0, fmt.Errorf("failed to fetch guilds: %v", err)
+			return 0, fmt.Errorf("failed to fetch guilds via REST API: %v", err)
 		}
 
 		if len(guilds) == 0 {
@@ -430,23 +458,31 @@ func getServerCountFromDiscordAPI(_, token string) (int, error) {
 		after = guilds[len(guilds)-1].ID
 	}
 
+	log.Printf("REST API returned %d guilds", totalGuilds)
+
+	// If both methods returned different results, log a warning
+	if guildCount > 0 && totalGuilds > 0 && guildCount != totalGuilds {
+		log.Printf("Warning: Gateway (%d) and REST API (%d) returned different counts", guildCount, totalGuilds)
+		// Return the larger count as it's more likely to be accurate for sharded bots
+		if guildCount > totalGuilds {
+			return guildCount, nil
+		}
+	}
+
 	return totalGuilds, nil
 }
 
 func sendServerCountNotification(allStats []BotStats) {
-	// Create fields for each bot
-	var fields []*discordgo.MessageEmbedField
-	var totalServers int
-	var hasErrors bool
+	var message string
+
+	message = "⏰" + time.Now().Format("2006-01-02 15:04:05")
 
 	for _, stats := range allStats {
 		var fieldValue string
 		if stats.Error != nil {
-			fieldValue = fmt.Sprintf("❌ Error: %v", stats.Error)
-			hasErrors = true
+			fieldValue = fmt.Sprintf("エラー: %v", stats.Error)
 		} else {
-			fieldValue = fmt.Sprintf("**%d** servers", stats.ServerCount)
-			totalServers += stats.ServerCount
+			fieldValue = fmt.Sprintf("**%d**", stats.ServerCount)
 		}
 
 		botDisplay := stats.BotName
@@ -454,49 +490,13 @@ func sendServerCountNotification(allStats []BotStats) {
 			botDisplay = stats.BotID
 		}
 
-		fields = append(fields, &discordgo.MessageEmbedField{
-			Name:   botDisplay,
-			Value:  fieldValue,
-			Inline: true,
-		})
+		message += "\n" + botDisplay + " : " + fieldValue
 	}
 
-	// Add timestamp field
-	fields = append(fields, &discordgo.MessageEmbedField{
-		Name:   "⏰ Timestamp",
-		Value:  time.Now().Format("2006-01-02 15:04:05"),
-		Inline: false,
-	})
-
-	// Add total if monitoring multiple bots
-	if len(allStats) > 1 {
-		fields = append(fields, &discordgo.MessageEmbedField{
-			Name:   "📊 Total Servers",
-			Value:  fmt.Sprintf("**%d** servers across all bots", totalServers),
-			Inline: false,
-		})
-	}
-
-	// Determine embed color based on whether there were errors
-	embedColor := 0x00ff00 // Green
-	if hasErrors {
-		embedColor = 0xffa500 // Orange for partial success
-	}
-
-	embed := &discordgo.MessageEmbed{
-		Title:       "📊 Daily Server Count Report",
-		Description: fmt.Sprintf("Monitoring %d bot(s)", len(allStats)),
-		Color:       embedColor,
-		Fields:      fields,
-		Footer: &discordgo.MessageEmbedFooter{
-			Text: "Daily Server Statistics",
-		},
-		Timestamp: time.Now().Format(time.RFC3339),
-	}
-
-	_, err := session.ChannelMessageSendEmbed(config.ChannelID, embed)
+	// messageの内容をDiscordに送信
+	_, err := session.ChannelMessageSend(config.ChannelID, message)
 	if err != nil {
-		log.Printf("Error sending notification: %v", err)
+		log.Printf("Error sending message: %v", err)
 	} else {
 		log.Printf("Successfully sent server count notification for %d bots", len(allStats))
 	}

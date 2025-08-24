@@ -102,6 +102,11 @@ CMD ["./statbot"]
 BOT_TOKENS=123456789012345678:MTA2NzQ...,987654321098765432:MTI3ODk...
 ```
 
+**shardされたbotについて：**
+- Gateway接続を使用して正確なサーバー数を取得
+- REST APIとGateway APIの両方を試行し、より大きい値を採用
+- shardされたbotでも正確な総サーバー数を取得可能
+
 ### 方法2: カスタムWebhookエンドポイント
 
 botが独自の統計APIを提供している場合：
