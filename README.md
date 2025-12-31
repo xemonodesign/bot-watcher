@@ -8,6 +8,8 @@
 - 毎日指定した時刻に自動通知
 - 複数のAPIソースからの取得に対応（top.gg、Discord Bot List）
 - エラー時の通知機能
+- **[NEW]** API使用回数の計測機能
+- **[NEW]** Framer Webhook転送機能
 
 ## セットアップ
 
@@ -34,6 +36,7 @@ cp .env.example .env
 - `BOT_TOKENS`: bot未登録サイトのボット用トークン（オプション、形式: BOT_ID:TOKEN）
 - `CUSTOM_WEBHOOKS`: カスタム統計エンドポイント（オプション、形式: BOT_ID:URL）
 - `NOTIFICATION_TIME`: 通知時刻（デフォルト: 09:00）
+- `PORT`: HTTPサーバーのポート（デフォルト: 8080）
 
 ### 3. Discord Botの作成
 
@@ -142,6 +145,31 @@ Webhookは以下のようなJSONを返す必要があります：
 1. `CHANNEL_ID`が正しいか確認
 2. botがそのチャンネルへのメッセージ送信権限を持っているか確認
 3. ログでエラーメッセージを確認
+
+## 追加機能 API & Webhooks
+
+本botはHTTPサーバーとしても動作します。
+
+### 1. API使用回数計測 (`/api/count`)
+
+指定したラベルのAPI呼び出し回数を計測し、毎日09:00にDiscord Webhookへ通知します。
+
+- **URL**: `/api/count?label=YOUR_LABEL`
+- **Method**: GET
+- **仕様**:
+  - ラベルごとにカウント
+  - 毎日00:00にリセット
+  - 毎日09:00に`CHANNEL_ID`へ集計結果を送信
+
+### 2. Framer Webhook転送 (`/api/framer`)
+
+Framerのフォーム送信を受け取り、Botがメッセージとして転送します。Framerの仕様（即時2xx応答必須）に対応しています。
+
+- **URL**: `/api/framer`
+- **Method**: POST
+- **仕様**:
+  - リクエスト受信後、即座にHTTP 200 OKを返却（再試行防止）
+  - 受け取ったJSONボディを整形して`CHANNEL_ID`へ非同期で送信
 
 ## ライセンス
 

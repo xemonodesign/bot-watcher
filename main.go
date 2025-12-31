@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -27,6 +29,7 @@ type Config struct {
 	NotificationTime string            // Cron format or time like "09:00"
 	CustomWebhooks   map[string]string // Bot ID -> Webhook URL for custom stats endpoints
 	BotTokens        map[string]string // Bot ID -> Bot Token for direct API access
+	Port             string
 }
 
 type TopGGStats struct {
@@ -42,8 +45,10 @@ type BotStats struct {
 }
 
 var (
-	config  Config
-	session *discordgo.Session
+	config     Config
+	session    *discordgo.Session
+	apiStats   map[string]int
+	statsMutex sync.Mutex
 )
 
 func main() {
@@ -121,6 +126,11 @@ func main() {
 		NotificationTime: os.Getenv("NOTIFICATION_TIME"),
 		CustomWebhooks:   customWebhooks,
 		BotTokens:        botTokens,
+		Port:             os.Getenv("PORT"),
+	}
+
+	if config.Port == "" {
+		config.Port = "8080"
 	}
 
 	if config.DiscordToken == "" || config.ChannelID == "" || len(config.TargetBotIDs) == 0 {
@@ -148,7 +158,13 @@ func main() {
 	}
 	defer session.Close()
 
-	// Setup cron job for daily notifications
+	// Initialize stats
+	apiStats = make(map[string]int)
+
+	// Start HTTP server
+	go startHTTPServer()
+
+	// Setup cron job for daily notifications and stats
 	setupDailyNotification()
 
 	// Setup memory cleanup routine
@@ -186,7 +202,19 @@ func setupDailyNotification() {
 	}
 
 	c.Start()
-	log.Printf("Daily notification scheduled at: %s", config.NotificationTime)
+	log.Printf("Daily server count notification scheduled at: %s", config.NotificationTime)
+
+	// Schedule stats reset at 00:00
+	_, err = c.AddFunc("0 0 * * *", resetApiStats)
+	if err != nil {
+		log.Printf("Error scheduling stats reset: %v", err)
+	}
+
+	// Schedule stats reporting at 09:00
+	_, err = c.AddFunc("0 9 * * *", reportApiStats)
+	if err != nil {
+		log.Printf("Error scheduling stats reporting: %v", err)
+	}
 }
 
 func setupMemoryCleanup() {
@@ -631,5 +659,119 @@ func sendServerCountNotification(allStats []BotStats) {
 		log.Printf("Error sending message: %v", err)
 	} else {
 		log.Printf("Successfully sent server count notification for %d bots", len(allStats))
+	}
+}
+
+// HTTP Server and Handlers
+
+func startHTTPServer() {
+	http.HandleFunc("/api/count", handleCount)
+	http.HandleFunc("/api/framer", handleFramerWebhook)
+
+	log.Printf("Starting HTTP server on port %s", config.Port)
+	if err := http.ListenAndServe(":"+config.Port, nil); err != nil {
+		log.Fatal("HTTP server error:", err)
+	}
+}
+
+func handleCount(w http.ResponseWriter, r *http.Request) {
+	label := r.URL.Query().Get("label")
+	if label == "" {
+		label = "default"
+	}
+
+	statsMutex.Lock()
+	apiStats[label]++
+	count := apiStats[label]
+	statsMutex.Unlock()
+
+	log.Printf("API count incremented for label '%s': %d", label, count)
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "Counted: %d", count)
+}
+
+func handleFramerWebhook(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Framer requires a 2xx response immediately.
+	// We read the body first to ensure we have it, then respond to Framer.
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("Error reading framer webhook body: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	defer r.Body.Close()
+
+	// Respond to Framer immediately
+	w.WriteHeader(http.StatusOK)
+
+	// Process forwarding asynchronously or synchronously
+	// Since we need to forward it and reliability matters, we'll do it synchronously here
+	// but after writing the header? No, `w.WriteHeader` sends the header.
+	// Actually, `w.WriteHeader` is implicit if we write to `w`.
+	// But to be safe and ensure Framer gets the 200, we should just forward it.
+	// If forwarding fails, we should still have returned 200 to Framer?
+	// The requirement says "Your webhook must return a 2xx HTTP status code to indicate successful receipt."
+	// So we should return 200 even if forwarding fails, as long as WE received it.
+
+	go forwardFramerWebhook(body)
+}
+
+func forwardFramerWebhook(body []byte) {
+	// Pretty print JSON if possible
+	var prettyJSON bytes.Buffer
+	var messageContent string
+
+	if err := json.Indent(&prettyJSON, body, "", "  "); err == nil {
+		messageContent = fmt.Sprintf("📨 **アンケートが届きました**\n```json\n%s\n```", prettyJSON.String())
+	} else {
+		messageContent = fmt.Sprintf("📨 **アンケートが届きました**\n```\n%s\n```", string(body))
+	}
+
+	_, err := session.ChannelMessageSend(config.ChannelID, messageContent)
+	if err != nil {
+		log.Printf("Error forwarding webhook to Discord: %v", err)
+	} else {
+		log.Println("Successfully forwarded Framer webhook to Discord channel")
+	}
+}
+
+func resetApiStats() {
+	statsMutex.Lock()
+	defer statsMutex.Unlock()
+
+	log.Println("Resetting API stats counter")
+	apiStats = make(map[string]int)
+}
+
+func reportApiStats() {
+	statsMutex.Lock()
+	// create a copy to avoid holding lock during network call
+	currentStats := make(map[string]int)
+	for k, v := range apiStats {
+		currentStats[k] = v
+	}
+	statsMutex.Unlock()
+
+	if len(currentStats) == 0 {
+		log.Println("No API stats to report")
+		return
+	}
+
+	var messageBuilder strings.Builder
+	messageBuilder.WriteString("📊 カウンター \n")
+	for label, count := range currentStats {
+		messageBuilder.WriteString(fmt.Sprintf("%s : %d\n", label, count))
+	}
+
+	_, err := session.ChannelMessageSend(config.ChannelID, messageBuilder.String())
+	if err != nil {
+		log.Printf("Error sending stats report: %v", err)
+	} else {
+		log.Println("Successfully reported API stats to Discord channel")
 	}
 }
