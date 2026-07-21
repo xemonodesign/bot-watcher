@@ -10,6 +10,7 @@
 - エラー時の通知機能
 - **[NEW]** API使用回数の計測機能
 - **[NEW]** Framer Webhook転送機能
+- **[NEW]** Jicoo Webhook → Discord通知機能
 
 ## セットアップ
 
@@ -37,6 +38,8 @@ cp .env.example .env
 - `CUSTOM_WEBHOOKS`: カスタム統計エンドポイント（オプション、形式: BOT_ID:URL）
 - `NOTIFICATION_TIME`: 通知時刻（デフォルト: 09:00）
 - `PORT`: HTTPサーバーのポート（デフォルト: 8080）
+- `DISCORD_WEBHOOK_URL`: Jicoo通知用のDiscord Incoming Webhook URL（推奨）
+- `JICOO_WEBHOOK_SECRET`: Jicoo Webhook署名シークレット（推奨）
 
 ### 3. Discord Botの作成
 
@@ -170,6 +173,25 @@ Framerのフォーム送信を受け取り、Botがメッセージとして転�
 - **仕様**:
   - リクエスト受信後、即座にHTTP 200 OKを返却（再試行防止）
   - 受け取ったJSONボディを整形して`CHANNEL_ID`へ非同期で送信
+
+### 3. Jicoo Webhook転送 (`/api/jicoo`)
+
+[Jicoo Webhook](https://developer.jicoo.com/doc-355758) を受け取り、Discord Incoming Webhookへ通知します。
+
+- **URL**: `/api/jicoo`
+- **Method**: POST
+- **仕様**:
+  - 受信後にHTTP 200を返却（Jicooの再送条件に対応）
+  - `JICOO_WEBHOOK_SECRET` 設定時は `Jicoo-Webhook-Signature` をHMAC-SHA256で検証
+  - 予約作成・変更・キャンセル等のイベントを埋め込みメッセージに整形
+  - `DISCORD_WEBHOOK_URL` へ送信（未設定時は `CHANNEL_ID` へBot送信）
+
+#### Jicoo側の設定手順
+
+1. [Jicoo Webhook設定](https://www.jicoo.com/dashboard/webhooks) でエンドポイントを作成
+2. URLに `https://YOUR_HOST/api/jicoo` を指定
+3. 表示される署名シークレットを `JICOO_WEBHOOK_SECRET` に設定
+4. Discordチャンネルの Integrations → Webhooks で作成したURLを `DISCORD_WEBHOOK_URL` に設定
 
 ## ライセンス
 

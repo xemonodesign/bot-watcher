@@ -2,6 +2,10 @@ package main
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +15,7 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -22,14 +27,16 @@ import (
 )
 
 type Config struct {
-	DiscordToken     string
-	ChannelID        string
-	TargetBotIDs     []string          // Multiple bot IDs
-	TopGGToken       string            // Optional: for top.gg API
-	NotificationTime string            // Cron format or time like "09:00"
-	CustomWebhooks   map[string]string // Bot ID -> Webhook URL for custom stats endpoints
-	BotTokens        map[string]string // Bot ID -> Bot Token for direct API access
-	Port             string
+	DiscordToken       string
+	ChannelID          string
+	TargetBotIDs       []string          // Multiple bot IDs
+	TopGGToken         string            // Optional: for top.gg API
+	NotificationTime   string            // Cron format or time like "09:00"
+	CustomWebhooks     map[string]string // Bot ID -> Webhook URL for custom stats endpoints
+	BotTokens          map[string]string // Bot ID -> Bot Token for direct API access
+	Port               string
+	DiscordWebhookURL  string // Discord Incoming Webhook URL for Jicoo notifications
+	JicooWebhookSecret string // Jicoo webhook signature secret
 }
 
 type TopGGStats struct {
@@ -119,14 +126,16 @@ func main() {
 	log.Printf("Configured %d custom webhooks", len(customWebhooks))
 
 	config = Config{
-		DiscordToken:     os.Getenv("DISCORD_TOKEN"),
-		ChannelID:        os.Getenv("CHANNEL_ID"),
-		TargetBotIDs:     botIDs,
-		TopGGToken:       os.Getenv("TOPGG_TOKEN"),
-		NotificationTime: os.Getenv("NOTIFICATION_TIME"),
-		CustomWebhooks:   customWebhooks,
-		BotTokens:        botTokens,
-		Port:             os.Getenv("PORT"),
+		DiscordToken:       os.Getenv("DISCORD_TOKEN"),
+		ChannelID:          os.Getenv("CHANNEL_ID"),
+		TargetBotIDs:       botIDs,
+		TopGGToken:         os.Getenv("TOPGG_TOKEN"),
+		NotificationTime:   os.Getenv("NOTIFICATION_TIME"),
+		CustomWebhooks:     customWebhooks,
+		BotTokens:          botTokens,
+		Port:               os.Getenv("PORT"),
+		DiscordWebhookURL:  os.Getenv("DISCORD_WEBHOOK_URL"),
+		JicooWebhookSecret: os.Getenv("JICOO_WEBHOOK_SECRET"),
 	}
 
 	if config.Port == "" {
@@ -667,6 +676,7 @@ func sendServerCountNotification(allStats []BotStats) {
 func startHTTPServer() {
 	http.HandleFunc("/api/count", handleCount)
 	http.HandleFunc("/api/framer", handleFramerWebhook)
+	http.HandleFunc("/api/jicoo", handleJicooWebhook)
 
 	log.Printf("Starting HTTP server on port %s", config.Port)
 	if err := http.ListenAndServe(":"+config.Port, nil); err != nil {
@@ -738,6 +748,325 @@ func forwardFramerWebhook(body []byte) {
 	} else {
 		log.Println("Successfully forwarded Framer webhook to Discord channel")
 	}
+}
+
+// Jicoo webhook types: https://developer.jicoo.com/doc-355758
+
+type JicooWebhookEvent struct {
+	Event     string      `json:"event"`
+	CreatedAt string      `json:"createdAt"`
+	Object    JicooObject `json:"object"`
+}
+
+type JicooObject struct {
+	UID          string         `json:"uid"`
+	EventTypeUID string         `json:"eventTypeUid"`
+	Status       string         `json:"status"`
+	TimeZone     string         `json:"timeZone"`
+	CreatedAt    string         `json:"createdAt"`
+	UpdatedAt    string         `json:"updatedAt"`
+	StartedAt    string         `json:"startedAt"`
+	EndedAt      string         `json:"endedAt"`
+	CancelReason *string        `json:"cancelReason"`
+	CancelledAt  *string        `json:"cancelledAt"`
+	CancelledBy  *string        `json:"cancelledBy"`
+	Contact      JicooContact   `json:"contact"`
+	Answers      []JicooAnswer  `json:"answers"`
+	Tracking     JicooTracking  `json:"tracking"`
+	DownloadLink *string        `json:"downloadLink"`
+}
+
+type JicooContact struct {
+	Email string `json:"email"`
+	Name  string `json:"name"`
+}
+
+type JicooAnswer struct {
+	Question string   `json:"question"`
+	Content  []string `json:"content"`
+}
+
+type JicooTracking struct {
+	UTMCampaign *string `json:"utm_campaign"`
+	UTMSource   *string `json:"utm_source"`
+	UTMMedium   *string `json:"utm_medium"`
+	UTMContent  *string `json:"utm_content"`
+	UTMTerm     *string `json:"utm_term"`
+}
+
+type DiscordWebhookPayload struct {
+	Content string         `json:"content,omitempty"`
+	Embeds  []DiscordEmbed `json:"embeds,omitempty"`
+}
+
+type DiscordEmbed struct {
+	Title       string              `json:"title,omitempty"`
+	Description string              `json:"description,omitempty"`
+	Color       int                 `json:"color,omitempty"`
+	Fields      []DiscordEmbedField `json:"fields,omitempty"`
+	Timestamp   string              `json:"timestamp,omitempty"`
+	Footer      *DiscordEmbedFooter `json:"footer,omitempty"`
+}
+
+type DiscordEmbedField struct {
+	Name   string `json:"name"`
+	Value  string `json:"value"`
+	Inline bool   `json:"inline,omitempty"`
+}
+
+type DiscordEmbedFooter struct {
+	Text string `json:"text"`
+}
+
+const jicooSignatureTolerance = 5 * time.Minute
+
+func handleJicooWebhook(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("Error reading Jicoo webhook body: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	defer r.Body.Close()
+
+	if config.JicooWebhookSecret != "" {
+		signatureHeader := r.Header.Get("Jicoo-Webhook-Signature")
+		if err := verifyJicooSignature(body, signatureHeader, config.JicooWebhookSecret); err != nil {
+			log.Printf("Jicoo signature verification failed: %v", err)
+			http.Error(w, "Invalid signature", http.StatusUnauthorized)
+			return
+		}
+	}
+
+	// Jicoo requires HTTP 200 on successful receipt; retry on non-2xx.
+	w.WriteHeader(http.StatusOK)
+
+	go forwardJicooWebhook(body)
+}
+
+func verifyJicooSignature(body []byte, header, secret string) error {
+	if header == "" {
+		return fmt.Errorf("missing Jicoo-Webhook-Signature header")
+	}
+
+	var timestamp string
+	var signatures []string
+	for _, part := range strings.Split(header, ",") {
+		kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		switch kv[0] {
+		case "t":
+			timestamp = kv[1]
+		case "v1":
+			signatures = append(signatures, kv[1])
+		}
+	}
+
+	if timestamp == "" || len(signatures) == 0 {
+		return fmt.Errorf("invalid signature header format")
+	}
+
+	ts, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid timestamp: %w", err)
+	}
+
+	if diff := time.Since(time.Unix(ts, 0)); diff > jicooSignatureTolerance || diff < -jicooSignatureTolerance {
+		return fmt.Errorf("timestamp outside tolerance: %s", timestamp)
+	}
+
+	signedPayload := timestamp + "." + string(body)
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(signedPayload))
+	expected := hex.EncodeToString(mac.Sum(nil))
+
+	for _, sig := range signatures {
+		if subtle.ConstantTimeCompare([]byte(expected), []byte(sig)) == 1 {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("signature mismatch")
+}
+
+func forwardJicooWebhook(body []byte) {
+	var event JicooWebhookEvent
+	if err := json.Unmarshal(body, &event); err != nil {
+		log.Printf("Error parsing Jicoo webhook JSON: %v", err)
+		return
+	}
+
+	payload := buildJicooDiscordPayload(event)
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("Error marshaling Discord webhook payload: %v", err)
+		return
+	}
+
+	if config.DiscordWebhookURL != "" {
+		if err := sendDiscordWebhook(config.DiscordWebhookURL, payloadBytes); err != nil {
+			log.Printf("Error sending Jicoo notification via Discord webhook: %v", err)
+			return
+		}
+		log.Printf("Successfully forwarded Jicoo event %s to Discord webhook", event.Event)
+		return
+	}
+
+	// Fallback: send via bot to CHANNEL_ID when Discord webhook URL is not configured
+	message := formatJicooPlainMessage(event)
+	if _, err := session.ChannelMessageSend(config.ChannelID, message); err != nil {
+		log.Printf("Error forwarding Jicoo webhook to Discord channel: %v", err)
+		return
+	}
+	log.Printf("Successfully forwarded Jicoo event %s to Discord channel", event.Event)
+}
+
+func sendDiscordWebhook(webhookURL string, payload []byte) error {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Post(webhookURL, "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("discord webhook returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
+func jicooEventLabel(event string) (string, int) {
+	switch event {
+	case "guest_booked":
+		return "新規予約", 0x57F287 // green
+	case "guest_rescheduled":
+		return "ゲストによる日程変更", 0xFEE75C // yellow
+	case "host_rescheduled":
+		return "ホストによる日程変更", 0xFEE75C
+	case "guest_cancelled":
+		return "ゲストによるキャンセル", 0xED4245 // red
+	case "host_cancelled":
+		return "ホストによるキャンセル", 0xED4245
+	case "guest_booking_request_created":
+		return "予約リクエスト作成", 0x5865F2 // blurple
+	case "host_booking_request_accepted":
+		return "予約リクエスト承認", 0x57F287
+	case "host_booking_request_declined":
+		return "予約リクエスト拒否", 0xED4245
+	case "recording_ready":
+		return "録画準備完了", 0xEB459E // fuchsia
+	default:
+		return event, 0x99AAB5
+	}
+}
+
+func formatJicooTime(value, timeZone string) string {
+	if value == "" {
+		return "-"
+	}
+	t, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		t, err = time.Parse(time.RFC3339, value)
+		if err != nil {
+			return value
+		}
+	}
+	loc, err := time.LoadLocation(timeZone)
+	if err != nil || timeZone == "" {
+		return t.Format("2006-01-02 15:04 MST")
+	}
+	return t.In(loc).Format("2006-01-02 15:04 MST")
+}
+
+func buildJicooDiscordPayload(event JicooWebhookEvent) DiscordWebhookPayload {
+	label, color := jicooEventLabel(event.Event)
+	obj := event.Object
+
+	fields := []DiscordEmbedField{
+		{Name: "ゲスト", Value: nonEmpty(obj.Contact.Name, "-"), Inline: true},
+		{Name: "メール", Value: nonEmpty(obj.Contact.Email, "-"), Inline: true},
+		{Name: "ステータス", Value: nonEmpty(obj.Status, "-"), Inline: true},
+		{Name: "開始", Value: formatJicooTime(obj.StartedAt, obj.TimeZone), Inline: true},
+		{Name: "終了", Value: formatJicooTime(obj.EndedAt, obj.TimeZone), Inline: true},
+		{Name: "タイムゾーン", Value: nonEmpty(obj.TimeZone, "-"), Inline: true},
+		{Name: "予約UID", Value: nonEmpty(obj.UID, "-"), Inline: false},
+	}
+
+	if obj.CancelReason != nil && *obj.CancelReason != "" {
+		fields = append(fields, DiscordEmbedField{
+			Name: "キャンセル理由", Value: *obj.CancelReason, Inline: false,
+		})
+	}
+	if obj.CancelledBy != nil && *obj.CancelledBy != "" {
+		fields = append(fields, DiscordEmbedField{
+			Name: "キャンセル者", Value: *obj.CancelledBy, Inline: true,
+		})
+	}
+	if obj.DownloadLink != nil && *obj.DownloadLink != "" {
+		fields = append(fields, DiscordEmbedField{
+			Name: "録画リンク", Value: *obj.DownloadLink, Inline: false,
+		})
+	}
+	if len(obj.Answers) > 0 {
+		var answers strings.Builder
+		for i, a := range obj.Answers {
+			if i > 0 {
+				answers.WriteString("\n")
+			}
+			answers.WriteString(fmt.Sprintf("**%s**: %s", a.Question, strings.Join(a.Content, ", ")))
+		}
+		value := answers.String()
+		if len(value) > 1024 {
+			value = value[:1021] + "..."
+		}
+		fields = append(fields, DiscordEmbedField{
+			Name: "回答", Value: value, Inline: false,
+		})
+	}
+
+	return DiscordWebhookPayload{
+		Content: fmt.Sprintf("📅 **Jicoo: %s**", label),
+		Embeds: []DiscordEmbed{{
+			Title:     label,
+			Color:     color,
+			Fields:    fields,
+			Timestamp: event.CreatedAt,
+			Footer:    &DiscordEmbedFooter{Text: "Jicoo Webhook"},
+		}},
+	}
+}
+
+func formatJicooPlainMessage(event JicooWebhookEvent) string {
+	label, _ := jicooEventLabel(event.Event)
+	obj := event.Object
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("📅 **Jicoo: %s**\n", label))
+	b.WriteString(fmt.Sprintf("ゲスト: %s (%s)\n", nonEmpty(obj.Contact.Name, "-"), nonEmpty(obj.Contact.Email, "-")))
+	b.WriteString(fmt.Sprintf("開始: %s\n", formatJicooTime(obj.StartedAt, obj.TimeZone)))
+	b.WriteString(fmt.Sprintf("終了: %s\n", formatJicooTime(obj.EndedAt, obj.TimeZone)))
+	b.WriteString(fmt.Sprintf("UID: %s", nonEmpty(obj.UID, "-")))
+	if obj.CancelReason != nil && *obj.CancelReason != "" {
+		b.WriteString(fmt.Sprintf("\nキャンセル理由: %s", *obj.CancelReason))
+	}
+	if obj.DownloadLink != nil && *obj.DownloadLink != "" {
+		b.WriteString(fmt.Sprintf("\n録画: %s", *obj.DownloadLink))
+	}
+	return b.String()
+}
+
+func nonEmpty(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
 }
 
 func resetApiStats() {

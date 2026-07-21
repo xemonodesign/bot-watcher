@@ -22,4 +22,9 @@ apiにはラベルをつけ、ラベルごとにカウントを取る
 機能3
 framerのフォームのwebhookを受け取って、受け次第その内容をDiscordのwebhookに送信する
 
+機能4
+Jicooのwebhookを受け取って、受け次第その内容をDiscordのwebhookに送信する
+- エンドポイント: POST /api/jicoo
+- Jicoo-Webhook-Signature を検証（JICOO_WEBHOOK_SECRET設定時）
+- DISCORD_WEBHOOK_URL へ整形した通知を送信
 
