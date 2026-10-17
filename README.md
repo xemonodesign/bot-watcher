@@ -38,6 +38,7 @@ cp .env.example .env
 - `CUSTOM_WEBHOOKS`: カスタム統計エンドポイント（オプション、形式: BOT_ID:URL）
 - `NOTIFICATION_TIME`: 通知時刻（デフォルト: 09:00）
 - `PORT`: HTTPサーバーのポート（デフォルト: 8080）
+- `TIMEZONE`: 定時処理のタイムゾーン（IANA名、デフォルト: Asia/Tokyo）
 - `DISCORD_WEBHOOK_URL`: Jicoo通知用のDiscord Incoming Webhook URL（推奨）
 - `JICOO_WEBHOOK_SECRET`: Jicoo Webhook署名シークレット（推奨）
 
@@ -158,11 +159,30 @@ Webhookは以下のようなJSONを返す必要があります：
 指定したラベルのAPI呼び出し回数を計測し、毎日09:00にDiscord Webhookへ通知します。
 
 - **URL**: `/api/count?label=YOUR_LABEL`
-- **Method**: GET
+- **Method**: GET / POST（`OPTIONS` はプリフライト用でカウントされません）
 - **仕様**:
-  - ラベルごとにカウント
-  - 毎日00:00にリセット
-  - 毎日09:00に`CHANNEL_ID`へ集計結果を送信
+  - ラベルごとにカウント（ラベルは64文字まで）
+  - 毎日00:00（`TIMEZONE`、既定は Asia/Tokyo）にその日の集計を締める
+  - 毎日09:00に **前日分** を `CHANNEL_ID` へ送信（ラベルはアルファベット順、0件なら「記録なし」）
+  - `Access-Control-Allow-Origin: *` を返すのでブラウザから直接叩けます
+  - カウンターはメモリ上にあるため、再起動すると当日分は失われます
+
+#### Webサイトの訪問数を数える
+
+静的サイト（GitHub Pages など）の `</body>` 直前に以下を入れると、タブごとに1回だけカウントされます：
+
+```html
+<script>
+(() => {
+  try {
+    if (sessionStorage.getItem("xv")) return;
+    sessionStorage.setItem("xv", "1");
+  } catch (_) {}
+  fetch("https://YOUR_HOST/api/count?label=YOUR_LABEL",
+        { mode: "no-cors", keepalive: true }).catch(() => {});
+})();
+</script>
+```
 
 ### 2. Framer Webhook転送 (`/api/framer`)
 

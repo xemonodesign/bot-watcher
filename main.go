@@ -15,11 +15,13 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	_ "time/tzdata" // embed zoneinfo so TIMEZONE works on minimal containers
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/joho/godotenv"
@@ -37,6 +39,7 @@ type Config struct {
 	Port               string
 	DiscordWebhookURL  string // Discord Incoming Webhook URL for Jicoo notifications
 	JicooWebhookSecret string // Jicoo webhook signature secret
+	TimeZone           string // IANA name for schedules, e.g. Asia/Tokyo (default)
 }
 
 type TopGGStats struct {
@@ -54,8 +57,15 @@ type BotStats struct {
 var (
 	config     Config
 	session    *discordgo.Session
-	apiStats   map[string]int
+	apiStats   map[string]int // counts for the current calendar day
 	statsMutex sync.Mutex
+
+	// Closed at 00:00 and reported at 09:00, so the morning report always
+	// covers the whole previous day.
+	yesterdayStats map[string]int
+	yesterdayDate  string
+
+	location = time.Local
 )
 
 func main() {
@@ -136,7 +146,10 @@ func main() {
 		Port:               os.Getenv("PORT"),
 		DiscordWebhookURL:  os.Getenv("DISCORD_WEBHOOK_URL"),
 		JicooWebhookSecret: os.Getenv("JICOO_WEBHOOK_SECRET"),
+		TimeZone:           os.Getenv("TIMEZONE"),
 	}
+
+	location = loadLocation(config.TimeZone)
 
 	if config.Port == "" {
 		config.Port = "8080"
@@ -193,8 +206,23 @@ func ready(s *discordgo.Session, event *discordgo.Ready) {
 	go checkAndNotifyServerCount()
 }
 
+// loadLocation resolves the schedule timezone. Defaults to Asia/Tokyo so the
+// 00:00 rollover and 09:00 report happen in Japan time even on a UTC host.
+func loadLocation(name string) *time.Location {
+	if name == "" {
+		name = "Asia/Tokyo"
+	}
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		log.Printf("Invalid TIMEZONE %q, falling back to server local time: %v", name, err)
+		return time.Local
+	}
+	return loc
+}
+
 func setupDailyNotification() {
-	c := cron.New()
+	c := cron.New(cron.WithLocation(location))
+	log.Printf("Schedules run in timezone %s", location)
 
 	// Convert time to cron expression if it's in HH:MM format
 	cronExpr := config.NotificationTime
@@ -213,10 +241,10 @@ func setupDailyNotification() {
 	c.Start()
 	log.Printf("Daily server count notification scheduled at: %s", config.NotificationTime)
 
-	// Schedule stats reset at 00:00
-	_, err = c.AddFunc("0 0 * * *", resetApiStats)
+	// Close the day's counter at 00:00 (kept as "yesterday" until reported)
+	_, err = c.AddFunc("0 0 * * *", rolloverApiStats)
 	if err != nil {
-		log.Printf("Error scheduling stats reset: %v", err)
+		log.Printf("Error scheduling stats rollover: %v", err)
 	}
 
 	// Schedule stats reporting at 09:00
@@ -685,9 +713,22 @@ func startHTTPServer() {
 }
 
 func handleCount(w http.ResponseWriter, r *http.Request) {
+	// Allow browser beacons from any site (GET fetch, sendBeacon POST, <img>)
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	label := r.URL.Query().Get("label")
 	if label == "" {
 		label = "default"
+	}
+	if len(label) > 64 {
+		label = label[:64]
 	}
 
 	statsMutex.Lock()
@@ -1069,38 +1110,66 @@ func nonEmpty(value, fallback string) string {
 	return value
 }
 
-func resetApiStats() {
+// rolloverApiStats runs at 00:00: the finished day's counts are kept as
+// "yesterday" for the 09:00 report, and a fresh counter starts for today.
+func rolloverApiStats() {
 	statsMutex.Lock()
 	defer statsMutex.Unlock()
 
-	log.Println("Resetting API stats counter")
+	yesterdayStats = apiStats
+	yesterdayDate = time.Now().In(location).AddDate(0, 0, -1).Format("2006-01-02")
 	apiStats = make(map[string]int)
+	log.Printf("API stats rolled over: %d labels closed for %s", len(yesterdayStats), yesterdayDate)
 }
 
+// buildApiStatsReport formats the daily report with labels in a stable order.
+func buildApiStatsReport(date string, stats map[string]int) string {
+	var b strings.Builder
+	b.WriteString("📊 カウンター")
+	if date != "" {
+		b.WriteString(" (" + date + ")")
+	}
+	b.WriteString("\n")
+
+	labels := make([]string, 0, len(stats))
+	for label, count := range stats {
+		if count > 0 {
+			labels = append(labels, label)
+		}
+	}
+	if len(labels) == 0 {
+		b.WriteString("記録なし\n")
+		return b.String()
+	}
+	sort.Strings(labels)
+	for _, label := range labels {
+		b.WriteString(fmt.Sprintf("%s : %d\n", label, stats[label]))
+	}
+	return b.String()
+}
+
+// reportApiStats runs at 09:00 and posts the previous day's counts.
 func reportApiStats() {
 	statsMutex.Lock()
-	// create a copy to avoid holding lock during network call
-	currentStats := make(map[string]int)
-	for k, v := range apiStats {
-		currentStats[k] = v
+	date := yesterdayDate
+	stats := make(map[string]int, len(yesterdayStats))
+	for k, v := range yesterdayStats {
+		stats[k] = v
 	}
+	yesterdayStats = nil
+	yesterdayDate = ""
 	statsMutex.Unlock()
 
-	if len(currentStats) == 0 {
-		log.Println("No API stats to report")
+	if date == "" {
+		// No rollover happened since startup (e.g. deployed after midnight)
+		log.Println("No closed day to report yet; skipping API stats report")
 		return
 	}
 
-	var messageBuilder strings.Builder
-	messageBuilder.WriteString("📊 カウンター \n")
-	for label, count := range currentStats {
-		messageBuilder.WriteString(fmt.Sprintf("%s : %d\n", label, count))
-	}
-
-	_, err := session.ChannelMessageSend(config.ChannelID, messageBuilder.String())
+	_, err := session.ChannelMessageSend(config.ChannelID, buildApiStatsReport(date, stats))
 	if err != nil {
 		log.Printf("Error sending stats report: %v", err)
 	} else {
-		log.Println("Successfully reported API stats to Discord channel")
+		log.Printf("Successfully reported API stats for %s to Discord channel", date)
 	}
 }
