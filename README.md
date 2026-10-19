@@ -186,7 +186,7 @@ Webhookは以下のようなJSONを返す必要があります：
 
 ### 2. アンケートフォーム受信 (`/api/survey`)
 
-静的サイト（chisei_web の `/thankyou`）に置いた素HTMLの `<form>` から直接送られてくるアンケートを受け取り、Botが `CHANNEL_ID` へ転送します。Framerのフォーム機能やWebhookは経由しません。
+静的サイト（chisei_web の `/thankyou`、xemono.life の `/minirobo/thankyou-*` と `/hibot/thankyou`）に置いた素HTMLの `<form>` から直接送られてくるアンケートを受け取り、Botが `CHANNEL_ID` へ転送します。Framerのフォーム機能やWebhookは経由しません。
 
 - **URL**: `/api/survey`
 - **Method**: POST（`OPTIONS` はプリフライト用）
@@ -198,6 +198,9 @@ Webhookは以下のようなJSONを返す必要があります：
   - ハニーポット `website` が埋まっていたら捨てる（botに悟られないよう 200 を返す）
   - `_next` フィールドがあり、JS無しの `<form>` 送信（ナビゲーション）なら、送信後に `Referer` と同じホスト上の `_next` へ 303 リダイレクトする（別ホストへは飛ばさない）。`fetch()` からの送信には `{"ok":true}` を返す
   - 本文は 64KB まで、1回答は 1500 文字で切り詰め、Discordの 2000 文字制限内に収める
+  - `_product` フィールドがあれば見出しを「📨 **<_product>のアンケートが届きました**」にする（無ければ従来どおり「知性アンケートが届きました」）
+  - `_page` フィールドに http(s) の URL があれば、末尾に送信元ページとして小さく添える（URL 以外は無視）
+  - `_next` / `_product` / `_page` / `website` は設問として扱わない
 
 #### サイト側の最小例
 
@@ -209,6 +212,8 @@ Webhookは以下のようなJSONを返す必要があります：
   <button type="submit">送信</button>
 </form>
 ```
+
+xemono.life のサンクスページは、質問文をフィールド名にして `_product`（例: `ねおきゴーレム`）と `_page`（ページの URL）を添え、`fetch()` で form-urlencoded を送っています。
 
 `/api/framer` は以前のFramer Webhook用エンドポイントで、互換のために残しています（受け取ったJSONをそのまま転送するだけ）。
 

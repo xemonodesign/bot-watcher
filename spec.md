@@ -25,6 +25,7 @@ apiにはラベルをつけ、ラベルごとにカウントを取る
 静的サイト（chisei_web /thankyou）の素HTMLフォームから直接POSTされるアンケートを受け取って、受け次第その内容をDiscordに送信する
 - エンドポイント: POST /api/survey（CORS対応、form-urlencoded / multipart / JSON）
 - ハニーポット `website` が埋まっていたら捨てる
+- `_product` があれば見出しに商品名を出す（xemono.life のサンクスページ用）、`_page` があれば送信元 URL を末尾に添える
 - JS無しの送信は `_next`（Referer と同じホストのみ）へ303で戻す
 - 旧 /api/framer（Framer Webhook）は互換のため残す
 

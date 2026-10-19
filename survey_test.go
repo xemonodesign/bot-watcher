@@ -244,11 +244,69 @@ func TestSurveyNavigationWithoutRefererShowsPage(t *testing.T) {
 
 func TestBuildSurveyMessageTruncatesLongAnswers(t *testing.T) {
 	long := strings.Repeat("あ", surveyMaxValueLen+50)
-	msg := buildSurveyMessage([]surveyField{newSurveyField("q", long)})
+	msg := buildSurveyMessage([]surveyField{newSurveyField("q", long)}, surveyMeta{})
 	if len([]rune(msg)) > surveyDiscordMax+1 {
 		t.Fatalf("message exceeds Discord limit: %d runes", len([]rune(msg)))
 	}
 	if !strings.HasSuffix(msg, "…") {
 		t.Fatalf("expected truncation marker, got tail %q", msg[len(msg)-10:])
+	}
+}
+
+func TestSurveyProductAndPageAreShownNotAnswered(t *testing.T) {
+	messages := captureSurvey(t)
+
+	body := "_product=" + url.QueryEscape("ねおきゴーレム") +
+		"&_page=" + url.QueryEscape("https://xemono.life/minirobo/thankyou-golem2589064q84") +
+		"&" + url.QueryEscape("ねおきゴーレムをどこで知りましたか？") + "=" + url.QueryEscape("Discord") +
+		"&website="
+	req := httptest.NewRequest(http.MethodPost, "/api/survey", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "https://xemono.life")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	rec := httptest.NewRecorder()
+
+	handleSurvey(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	msg := waitSurvey(t, messages)
+	want := "📨 **ねおきゴーレムのアンケートが届きました**\n" +
+		"**ねおきゴーレムをどこで知りましたか？**\n> Discord\n" +
+		"-# https://xemono.life/minirobo/thankyou-golem2589064q84"
+	if msg != want {
+		t.Fatalf("unexpected message:\n%s\nwant:\n%s", msg, want)
+	}
+}
+
+func TestSurveyMetaOnlyIsEmptySubmission(t *testing.T) {
+	messages := captureSurvey(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/survey", strings.NewReader("_product=x&_page=https%3A%2F%2Fxemono.life%2F"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	handleSurvey(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 when only meta fields are sent, got %d", rec.Code)
+	}
+	assertNoSurvey(t, messages)
+}
+
+func TestSurveyPageFooterOnlyAcceptsHTTPURLs(t *testing.T) {
+	if got := surveyPageURL("javascript:alert(1)"); got != "" {
+		t.Fatalf("expected non-http page to be dropped, got %q", got)
+	}
+	if got := surveyPageURL("  https://xemono.life/hibot/thankyou  "); got != "https://xemono.life/hibot/thankyou" {
+		t.Fatalf("unexpected page url %q", got)
+	}
+	msg := buildSurveyMessage([]surveyField{newSurveyField("q", "a")}, surveyMeta{})
+	if strings.Contains(msg, "-#") {
+		t.Fatalf("no footer expected without a page:\n%s", msg)
+	}
+	if !strings.HasPrefix(msg, "📨 **知性アンケートが届きました**") {
+		t.Fatalf("default heading should stay for chisei_web:\n%s", msg)
 	}
 }
