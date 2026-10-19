@@ -28,17 +28,27 @@ import (
 // small JSON body.
 
 const (
-	surveyMaxBody     = 64 << 10 // request body limit in bytes
-	surveyMaxFields   = 20       // answers kept per submission
-	surveyMaxValueLen = 1500     // runes kept per answer
-	surveyHoneypot    = "website"
-	surveyNextField   = "_next"
-	surveyDiscordMax  = 1900 // Discord message limit is 2000 characters
+	surveyMaxBody      = 64 << 10 // request body limit in bytes
+	surveyMaxFields    = 20       // answers kept per submission
+	surveyMaxValueLen  = 1500     // runes kept per answer
+	surveyHoneypot     = "website"
+	surveyNextField    = "_next"
+	surveyProductField = "_product" // which product the survey is about (shown in the heading)
+	surveyPageField    = "_page"    // URL of the page that sent it (shown as a footer)
+	surveyMaxMetaLen   = 300
+	surveyDiscordMax   = 1900 // Discord message limit is 2000 characters
 )
 
 type surveyField struct {
 	Name  string
 	Value string
+}
+
+// surveyMeta holds the reserved fields that describe a submission rather
+// than answer a question.
+type surveyMeta struct {
+	Product string // e.g. "ねおきゴーレム"; empty means the chisei_web survey
+	Page    string // http(s) URL of the sending page, or empty
 }
 
 // surveyNotify delivers the formatted message. Tests replace it.
@@ -70,6 +80,7 @@ func handleSurvey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var answers []surveyField
+	var meta surveyMeta
 	next := ""
 	spam := false
 	for _, f := range fields {
@@ -78,6 +89,10 @@ func handleSurvey(w http.ResponseWriter, r *http.Request) {
 			spam = spam || f.Value != ""
 		case surveyNextField:
 			next = f.Value
+		case surveyProductField:
+			meta.Product = truncateRunes(f.Value, surveyMaxMetaLen)
+		case surveyPageField:
+			meta.Page = surveyPageURL(f.Value)
 		default:
 			if f.Value == "" {
 				continue
@@ -97,7 +112,7 @@ func handleSurvey(w http.ResponseWriter, r *http.Request) {
 		if len(answers) > surveyMaxFields {
 			answers = answers[:surveyMaxFields]
 		}
-		go surveyNotify(buildSurveyMessage(answers))
+		go surveyNotify(buildSurveyMessage(answers, meta))
 	}
 
 	if surveyWantsNavigation(r) {
@@ -244,15 +259,39 @@ func newSurveyField(name, value string) surveyField {
 	return surveyField{Name: strings.TrimSpace(name), Value: value}
 }
 
-func buildSurveyMessage(answers []surveyField) string {
+// surveyPageURL keeps only an http(s) URL so the footer can never carry
+// javascript: links or stray text.
+func surveyPageURL(value string) string {
+	value = truncateRunes(strings.TrimSpace(value), surveyMaxMetaLen)
+	if strings.HasPrefix(value, "https://") || strings.HasPrefix(value, "http://") {
+		return value
+	}
+	return ""
+}
+
+func truncateRunes(s string, max int) string {
+	if runes := []rune(s); len(runes) > max {
+		return string(runes[:max])
+	}
+	return s
+}
+
+func buildSurveyMessage(answers []surveyField, meta surveyMeta) string {
 	var b strings.Builder
-	b.WriteString("📨 **知性アンケートが届きました**\n")
+	if meta.Product != "" {
+		b.WriteString("📨 **" + meta.Product + "のアンケートが届きました**\n")
+	} else {
+		b.WriteString("📨 **知性アンケートが届きました**\n")
+	}
 	for _, a := range answers {
 		b.WriteString("**")
 		b.WriteString(a.Name)
 		b.WriteString("**\n> ")
 		b.WriteString(strings.ReplaceAll(a.Value, "\n", "\n> "))
 		b.WriteString("\n")
+	}
+	if meta.Page != "" {
+		b.WriteString("-# " + meta.Page + "\n")
 	}
 	msg := strings.TrimRight(b.String(), "\n")
 	if runes := []rune(msg); len(runes) > surveyDiscordMax {
