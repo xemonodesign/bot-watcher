@@ -22,7 +22,11 @@ apiにはラベルをつけ、ラベルごとにカウントを取る
 ラベルが1つもなければ「記録なし」と送る
 
 機能3
-framerのフォームのwebhookを受け取って、受け次第その内容をDiscordのwebhookに送信する
+静的サイト（chisei_web /thankyou）の素HTMLフォームから直接POSTされるアンケートを受け取って、受け次第その内容をDiscordに送信する
+- エンドポイント: POST /api/survey（CORS対応、form-urlencoded / multipart / JSON）
+- ハニーポット `website` が埋まっていたら捨てる
+- JS無しの送信は `_next`（Referer と同じホストのみ）へ303で戻す
+- 旧 /api/framer（Framer Webhook）は互換のため残す
 
 機能4
 Jicooのwebhookを受け取って、受け次第その内容をDiscordのwebhookに送信する

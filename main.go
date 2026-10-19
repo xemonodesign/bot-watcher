@@ -703,7 +703,8 @@ func sendServerCountNotification(allStats []BotStats) {
 
 func startHTTPServer() {
 	http.HandleFunc("/api/count", handleCount)
-	http.HandleFunc("/api/framer", handleFramerWebhook)
+	http.HandleFunc("/api/survey", handleSurvey)
+	http.HandleFunc("/api/framer", handleFramerWebhook) // legacy: Framer-hosted form webhook
 	http.HandleFunc("/api/jicoo", handleJicooWebhook)
 
 	log.Printf("Starting HTTP server on port %s", config.Port)

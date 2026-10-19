@@ -9,7 +9,7 @@
 - 複数のAPIソースからの取得に対応（top.gg、Discord Bot List）
 - エラー時の通知機能
 - **[NEW]** API使用回数の計測機能
-- **[NEW]** Framer Webhook転送機能
+- **[NEW]** 知性アンケート（静的サイトのフォーム）受信 → Discord通知機能
 - **[NEW]** Jicoo Webhook → Discord通知機能
 
 ## セットアップ
@@ -184,15 +184,33 @@ Webhookは以下のようなJSONを返す必要があります：
 </script>
 ```
 
-### 2. Framer Webhook転送 (`/api/framer`)
+### 2. アンケートフォーム受信 (`/api/survey`)
 
-Framerのフォーム送信を受け取り、Botがメッセージとして転送します。Framerの仕様（即時2xx応答必須）に対応しています。
+静的サイト（chisei_web の `/thankyou`）に置いた素HTMLの `<form>` から直接送られてくるアンケートを受け取り、Botが `CHANNEL_ID` へ転送します。Framerのフォーム機能やWebhookは経由しません。
 
-- **URL**: `/api/framer`
-- **Method**: POST
+- **URL**: `/api/survey`
+- **Method**: POST（`OPTIONS` はプリフライト用）
+- **受け付ける形式**: `application/x-www-form-urlencoded`、`multipart/form-data`、JSON（`application/json` / `text/plain`）
 - **仕様**:
-  - リクエスト受信後、即座にHTTP 200 OKを返却（再試行防止）
-  - 受け取ったJSONボディを整形して`CHANNEL_ID`へ非同期で送信
+  - `Access-Control-Allow-Origin: *` を返すのでブラウザの `fetch()` から直接送れる（form-urlencoded ならプリフライトも不要）
+  - フィールドは送られてきた順のまま、`**設問名**` + 引用ブロックの形でDiscordに投稿する
+  - 空欄の設問は飛ばす。全部空なら 400
+  - ハニーポット `website` が埋まっていたら捨てる（botに悟られないよう 200 を返す）
+  - `_next` フィールドがあり、JS無しの `<form>` 送信（ナビゲーション）なら、送信後に `Referer` と同じホスト上の `_next` へ 303 リダイレクトする（別ホストへは飛ばさない）。`fetch()` からの送信には `{"ok":true}` を返す
+  - 本文は 64KB まで、1回答は 1500 文字で切り詰め、Discordの 2000 文字制限内に収める
+
+#### サイト側の最小例
+
+```html
+<form method="post" action="https://YOUR_HOST/api/survey" accept-charset="UTF-8">
+  <label>知性をどこで知りましたか？<textarea name="知性をどこで知りましたか？"></textarea></label>
+  <input type="hidden" name="_next" value="/thankyou/#survey-sent">
+  <label hidden aria-hidden="true">website<input type="text" name="website" tabindex="-1" autocomplete="off"></label>
+  <button type="submit">送信</button>
+</form>
+```
+
+`/api/framer` は以前のFramer Webhook用エンドポイントで、互換のために残しています（受け取ったJSONをそのまま転送するだけ）。
 
 ### 3. Jicoo Webhook転送 (`/api/jicoo`)
 
